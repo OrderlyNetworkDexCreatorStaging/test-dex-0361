@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "dependencies": {
+    "@orderly.network/plugin-core": "3.1.7",
+    "@orderly.network/trading-next": "3.1.7",
+    "@orderly.network/utils": "3.1.7",
+    "@tarnadas/orderbook-shimmer-plugin": "0.0.7"
+  }
+}

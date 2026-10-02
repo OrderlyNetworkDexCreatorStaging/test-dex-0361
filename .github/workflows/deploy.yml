@@ -78,7 +78,10 @@ jobs:
         run: |
           echo "sync_happened=false" >> $GITHUB_OUTPUT
           git remote add upstream https://github.com/OrderlyNetworkDexCreatorStaging/dex-creator-template.git || true
-          git fetch upstream
+          # Explicit refspec: every template branch must be present locally, or
+          # the rev-parse checks below would silently fall back to main.
+          git fetch upstream "+refs/heads/*:refs/remotes/upstream/*" --no-tags
+          echo "Upstream branches fetched: $(git for-each-ref --format='%(refname:short)' refs/remotes/upstream/ | tr '\n' ' ')"
 
           # dex-creator API bakes literals at commit time (see github.ts getDeployYmlContentForRepo):
           # vars.VITE_DEPLOYMENT_ENV below and OrderlyNetworkDexCreatorStaging/dex-creator-template above; forks often have no repo vars set.
@@ -88,6 +91,16 @@ jobs:
             UPSTREAM_BRANCH="main"
           elif [ "$DEPLOYMENT_ENV" = "staging" ]; then
             if git rev-parse --verify upstream/staging >/dev/null 2>&1; then
+              UPSTREAM_BRANCH="staging"
+            else
+              UPSTREAM_BRANCH="main"
+            fi
+          elif [ "$DEPLOYMENT_ENV" = "dev" ]; then
+            # dev follows the QA template line (same treatment as the API's
+            # audit repos/callback origins); main is the last resort.
+            if git rev-parse --verify upstream/qa >/dev/null 2>&1; then
+              UPSTREAM_BRANCH="qa"
+            elif git rev-parse --verify upstream/staging >/dev/null 2>&1; then
               UPSTREAM_BRANCH="staging"
             else
               UPSTREAM_BRANCH="main"
@@ -104,10 +117,13 @@ jobs:
             UPSTREAM_BRANCH="main"
           fi
 
-          # Non-mainnet template lines (qa/staging): on merge conflicts, prefer upstream hunks.
-          # mainnet and fallback-to-main merges stay default (manual resolution if conflict).
+          # Non-mainnet environments: prefer upstream hunks on conflict. Keyed
+          # off the environment (not the resolved branch) so every non-mainnet
+          # line — dev, qa, staging, future envs — stays auto-mergeable even
+          # when it falls back to the main branch. Mainnet keeps the strict
+          # default (manual resolution if a conflict ever appears).
           MERGE_EXTRA=""
-          if [ "$UPSTREAM_BRANCH" = "qa" ] || [ "$UPSTREAM_BRANCH" = "staging" ]; then
+          if [ "$DEPLOYMENT_ENV" != "mainnet" ]; then
             MERGE_EXTRA="-X theirs"
             echo "Merging upstream/$UPSTREAM_BRANCH with -X theirs (conflicted hunks favor upstream)"
           fi
@@ -140,7 +156,9 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: "20"
+          # 24 to match local dev and satisfy the dependency tree that plugin
+          # installs pull in (e.g. commander@15 needs >=22.12 via wallet deps).
+          node-version: "24"
           cache: "yarn"
           cache-dependency-path: |
             yarn.lock
@@ -152,22 +170,34 @@ jobs:
             node_modules
             ~/.yarn/cache
           key: ${{ runner.os }}-deps-${{ hashFiles('**/yarn.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-deps-
 
       - name: Check if only config changed
         id: check-changes
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "needs_build=true" >> $GITHUB_OUTPUT
+            echo "package_changed=true" >> $GITHUB_OUTPUT
             echo "Manual trigger detected - forcing full build"
           elif [ "${{ steps.sync_fork.outputs.sync_happened }}" = "true" ]; then
             echo "needs_build=true" >> $GITHUB_OUTPUT
+            echo "package_changed=true" >> $GITHUB_OUTPUT
             echo "Fork sync happened - forcing full build"
-          elif git diff --name-only ${{ github.event.before }} ${{ github.sha }} | grep -q -v "^public/config\.js$"; then
-            echo "needs_build=true" >> $GITHUB_OUTPUT
           else
-            echo "needs_build=false" >> $GITHUB_OUTPUT
+            CHANGED="$(git diff --name-only ${{ github.event.before }} ${{ github.sha }} 2>/dev/null || echo "package.json")"
+            if echo "$CHANGED" | grep -q -v "^public/config\.js$"; then
+              echo "needs_build=true" >> $GITHUB_OUTPUT
+            else
+              echo "needs_build=false" >> $GITHUB_OUTPUT
+            fi
+            # Plugin installs commit package.json (and the pin manifest)
+            # without a refreshed yarn.lock; only then may the install resolve
+            # new deps (exact pins keep it reproducible). The refreshed lock is
+            # committed back below, so every later build can stay frozen.
+            if echo "$CHANGED" | grep -q -E "^(package\.json|\.orderly-plugin-deps\.json)$"; then
+              echo "package_changed=true" >> $GITHUB_OUTPUT
+            else
+              echo "package_changed=false" >> $GITHUB_OUTPUT
+            fi
           fi
         continue-on-error: true
 
@@ -206,9 +236,38 @@ jobs:
           fi
         id: force-build
 
-      - name: Install dependencies
+      - name: Re-apply Orderly One plugin dependencies
         if: steps.check-changes.outputs.needs_build == 'true' || steps.force-build.outputs.needs_build == 'true'
+        run: |
+          # The upstream merge rewrites package.json; restore the plugin pins
+          # before install so generated.ts imports resolve. No-op without a
+          # manifest (no plugins installed). Skipped on the config-only fast
+          # path, which deploys a cached build.
+          if [ -f .github/scripts/apply-plugin-deps.mjs ]; then
+            node .github/scripts/apply-plugin-deps.mjs
+          fi
+
+      - name: Install dependencies
+        if: (steps.check-changes.outputs.needs_build == 'true' || steps.force-build.outputs.needs_build == 'true') && steps.check-changes.outputs.package_changed != 'true'
         run: yarn install --frozen-lockfile --prefer-offline
+
+      - name: Install dependencies (with plugin changes)
+        if: (steps.check-changes.outputs.needs_build == 'true' || steps.force-build.outputs.needs_build == 'true') && steps.check-changes.outputs.package_changed == 'true'
+        run: yarn install --prefer-offline
+
+      - name: Commit refreshed yarn.lock
+        if: steps.check-changes.outputs.package_changed == 'true'
+        run: |
+          # Keep the fork's lockfile truthful so later builds can stay frozen.
+          # [skip ci] avoids a second workflow run; a non-fast-forward push is
+          # non-fatal (the next sync reconciles).
+          if [ -n "$(git status --porcelain yarn.lock)" ]; then
+            git add yarn.lock
+            git commit -m "chore: refresh yarn.lock for Orderly One plugins [skip ci]"
+            git push origin main || echo "lockfile push skipped (non-fast-forward)"
+          else
+            echo "yarn.lock already current"
+          fi
 
       - name: Build with repository base path
         if: ${{ steps.check-custom-domain.outputs.has_custom_domain == 'false' && (steps.check-changes.outputs.needs_build == 'true' || steps.force-build.outputs.needs_build == 'true') }}
