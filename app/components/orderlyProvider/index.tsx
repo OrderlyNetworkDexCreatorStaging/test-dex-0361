@@ -87,11 +87,32 @@ const OrderlyProvider = (props: { children: ReactNode }) => {
 
   const parseDefaultChain = (
     envVar: string | undefined,
-  ): { mainnet: { id: number } } | undefined => {
+    options?: {
+      mainnet?: Array<{ id: number }>;
+      testnet?: Array<{ id: number }>;
+      networkId: NetworkId;
+    },
+  ): { mainnet?: { id: number }; testnet?: { id: number } } | undefined => {
     if (!envVar) return undefined;
 
     const chainId = parseInt(envVar.trim(), 10);
-    return !isNaN(chainId) ? { mainnet: { id: chainId } } : undefined;
+    if (isNaN(chainId)) return undefined;
+
+    const inMainnet = options?.mainnet?.some((chain) => chain.id === chainId);
+    const inTestnet = options?.testnet?.some((chain) => chain.id === chainId);
+
+    if (inMainnet || inTestnet) {
+      return {
+        ...(inMainnet ? { mainnet: { id: chainId } } : {}),
+        ...(inTestnet ? { testnet: { id: chainId } } : {}),
+      };
+    }
+
+    // No filter match (or filters unset): only set the current networkId key
+    // to avoid applying a mainnet chainId on testnet (and vice versa).
+    return options?.networkId === "testnet"
+      ? { testnet: { id: chainId } }
+      : { mainnet: { id: chainId } };
   };
 
   const disableMainnet = getRuntimeConfigBoolean("VITE_DISABLE_MAINNET");
@@ -113,6 +134,11 @@ const OrderlyProvider = (props: { children: ReactNode }) => {
 
   const defaultChain = parseDefaultChain(
     getRuntimeConfig("VITE_DEFAULT_CHAIN"),
+    {
+      mainnet: mainnetChains,
+      testnet: testnetChains,
+      networkId,
+    },
   );
 
   const dataAdapter = createSymbolDataAdapter();
